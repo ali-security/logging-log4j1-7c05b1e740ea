@@ -143,7 +143,6 @@ target platform and specify -Dntdll_target=msbuild on the mvn command line.
             <include>org/apache/log4j/RFATestCase.java</include>
             <include>org/apache/log4j/varia/ERFATestCase.java</include>
             <include>org/apache/log4j/net/SyslogAppenderTest</include>
-            <include>org/apache/log4j/nt/NTEventLogAppenderTest</include>
             <include>org/apache/log4j/net/SocketAppenderTest</include>
           </includes>
         </configuration>
@@ -155,6 +154,10 @@ target platform and specify -Dntdll_target=msbuild on the mvn command line.
           <source>1.4</source>
           <target>1.4</target>
           <encoding>UTF-8</encoding>
+          <!--  NTEventLogAppender has been removed (DLL preloading)  -->
+          <testExcludes>
+            <testExclude>org/apache/log4j/nt/**</testExclude>
+          </testExcludes>
         </configuration>
       </plugin>
       <plugin>
