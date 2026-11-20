@@ -19,10 +19,15 @@ package org.apache.log4j.net;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InvalidClassException;
+import java.io.InvalidObjectException;
 import java.io.ObjectInputStream;
 import java.io.ObjectStreamClass;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 /**
  * HardenedObjectInputStream restricts the set of classes that can be
@@ -45,8 +50,33 @@ public class HardenedObjectInputStream extends ObjectInputStream {
 	final List whitelistedClassNames;
 	final static String[] JAVA_PACKAGES = new String[] { "java.lang", "java.util", ARRAY_CLASS_PREFIX + "java.lang" };
 
+	/**
+	 * Maximum number of Map/Collection instances allowed during deserialization
+	 * of a single object graph. This mitigates CVE-2023-26464 where deeply
+	 * nested hash-based collections cause exponential hashCode() computation.
+	 *
+	 * With N collection objects, the worst-case hashCode cost is O(2^(N/2)).
+	 * A limit of 32 bounds this to O(2^16) = ~65K operations.
+	 * A normal LoggingEvent has 1-2 collections (MDC Hashtable, properties).
+	 *
+	 * The same limit also applies to the number of collection occurrences
+	 * reachable from a single collection when shared references are followed
+	 * (i.e. the number of collections its hashCode() visits), so that a few
+	 * collections referencing each other many times cannot bypass it.
+	 */
+	static final int MAX_COLLECTION_COUNT = 32;
+
+	private int collectionCount = 0;
+
+	/**
+	 * Collection occurrences reachable from each Map/Collection/Map.Entry
+	 * resolved so far, keyed by identity.
+	 */
+	private final Map collectionWeights = new IdentityHashMap();
+
 	public HardenedObjectInputStream(InputStream in, String[] whilelist) throws IOException {
 		super(in);
+		enableResolveObject(true);
 
 		this.whitelistedClassNames = new ArrayList();
 		if (whilelist != null) {
@@ -58,6 +88,7 @@ public class HardenedObjectInputStream extends ObjectInputStream {
 
 	public HardenedObjectInputStream(InputStream in, List whitelist) throws IOException {
 		super(in);
+		enableResolveObject(true);
 
 		this.whitelistedClassNames = new ArrayList();
 		this.whitelistedClassNames.addAll(whitelist);
@@ -85,6 +116,87 @@ public class HardenedObjectInputStream extends ObjectInputStream {
 				return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Reads an object from the stream, resetting the collection counter
+	 * so that each top-level readObject call gets its own budget.
+	 * Callers should use this instead of {@link #readObject()} directly
+	 * when reading multiple objects from the same stream.
+	 */
+	public Object readAdaptedObject() throws IOException, ClassNotFoundException {
+		collectionCount = 0;
+		collectionWeights.clear();
+		return readObject();
+	}
+
+	/**
+	 * Counts Map, Collection and Map.Entry instances during deserialization to prevent
+	 * CVE-2023-26464: deeply nested hash-based collections cause exponential
+	 * hashCode() computation during deserialization.
+	 *
+	 * Collections are resolved once fully read, i.e. before they are hashed
+	 * by an enclosing hash-based collection.
+	 */
+	protected Object resolveObject(Object obj) throws IOException {
+		if (isCollection(obj)) {
+			collectionCount++;
+			if (collectionCount > MAX_COLLECTION_COUNT) {
+				throw collectionLimitExceeded();
+			}
+			collectionWeights.put(obj, new Integer(computeWeight(obj)));
+		}
+		return super.resolveObject(obj);
+	}
+
+	private static boolean isCollection(Object obj) {
+		return obj instanceof Map || obj instanceof Collection || obj instanceof Map.Entry;
+	}
+
+	/**
+	 * Returns the number of collection occurrences reachable from the given
+	 * collection, counting a shared collection once per reference to it.
+	 */
+	private int computeWeight(Object collection) throws InvalidObjectException {
+		int weight = 1;
+		if (collection instanceof Map) {
+			Iterator it = ((Map) collection).entrySet().iterator();
+			while (it.hasNext()) {
+				Map.Entry entry = (Map.Entry) it.next();
+				weight = addWeight(weight, entry.getKey());
+				weight = addWeight(weight, entry.getValue());
+			}
+		} else if (collection instanceof Collection) {
+			Iterator it = ((Collection) collection).iterator();
+			while (it.hasNext()) {
+				weight = addWeight(weight, it.next());
+			}
+		} else {
+			Map.Entry entry = (Map.Entry) collection;
+			weight = addWeight(weight, entry.getKey());
+			weight = addWeight(weight, entry.getValue());
+		}
+		return weight;
+	}
+
+	private int addWeight(int weight, Object element) throws InvalidObjectException {
+		if (!isCollection(element)) {
+			return weight;
+		}
+		Integer elementWeight = (Integer) collectionWeights.get(element);
+		// a collection that is not resolved yet is an enclosing one still being read
+		weight += (elementWeight == null) ? 1 : elementWeight.intValue();
+		if (weight > MAX_COLLECTION_COUNT) {
+			throw collectionLimitExceeded();
+		}
+		return weight;
+	}
+
+	private static InvalidObjectException collectionLimitExceeded() {
+		return new InvalidObjectException(
+			"Exceeded maximum number of collection objects during deserialization: "
+			+ MAX_COLLECTION_COUNT
+			+ ". Possible CVE-2023-26464 attack via nested collections.");
 	}
 
 	protected void addToWhitelist(List additionalAuthorizedClasses) {
